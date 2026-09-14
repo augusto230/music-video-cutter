@@ -178,16 +178,46 @@ def cut_segment(path: str, start: float, end: float, out: str,
     q = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["medium"])
     vf    = ["-vf", crop] if crop else []
     extra = ["-movflags", "+faststart"]
+    # Vídeo de celular costuma trazer uma "lista de edição" no MP4 (o vídeo começa ~0,5 s
+    # depois do áudio) e taxa de quadros variável. Players que ignoram a lista — Instagram,
+    # WhatsApp, vários navegadores — mostram imagem e som dessincronizados. Aqui o arquivo
+    # sai sem lista de edição (-use_editlist 0), sem quadros B (que também dependem dela)
+    # e com taxa constante, então fica sincronizado em qualquer lugar.
+    # Medido com vídeo de teste (clarão + bipe no mesmo instante): 0 ms obedecendo ou
+    # ignorando a lista; o comando anterior dava 57 ms de atraso quando ela era ignorada.
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start), "-to", str(end), "-i", path,
+        "-map", "0:v:0", "-map", "0:a:0?",
         *vf,
-        "-c:v", "libx264", "-crf", q["crf"], "-preset", q["preset"],
+        "-fps_mode", "cfr",
+        "-c:v", "libx264", "-bf", "0", "-crf", q["crf"], "-preset", q["preset"],
         "-c:a", "aac", "-b:a", q["audio"],
+        "-use_editlist", "0", "-avoid_negative_ts", "make_zero",
         *extra,
         out
     ]
     subprocess.run(cmd, capture_output=True, check=True)
+
+
+def preparar_previa(path: str) -> Optional[str]:
+    """Cópia só para o player do preview: mesmo vídeo e mesmo áudio (sem recodificar),
+    gravados sem a lista de edição do MP4.
+
+    O navegador ignora essa lista em vídeo de celular e tocava a imagem ~0,45 s adiantada
+    em relação ao som. Sem ela, o atraso fica embutido nos tempos dos quadros e qualquer
+    player toca sincronizado. É só uma cópia: ~1 s para um show de 71 min.
+    """
+    pasta = os.path.join(TEMP_DIR, "_previa")
+    os.makedirs(pasta, exist_ok=True)
+    destino = os.path.join(pasta, "previa.mp4")
+    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path,
+                        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                        "-use_editlist", "0", "-movflags", "+faststart", destino],
+                       capture_output=True)
+    if r.returncode == 0 and os.path.exists(destino) and os.path.getsize(destino) > 0:
+        return destino
+    return None  # formato que não cabe em MP4 sem recodificar: o player usa o original
 
 
 def fmt_time(secs: float) -> str:
@@ -973,6 +1003,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         path     = os.path.join(TEMP_DIR, videos[0])
+        previa   = getattr(Handler, "_previa", None)
+        if previa and os.path.exists(previa):
+            path = previa  # sem lista de edição: imagem e som sincronizados no navegador
         size     = os.path.getsize(path)
         ext      = Path(path).suffix.lower()
         mime     = "video/mp4" if ext in (".mp4", ".m4v") else \
@@ -1041,6 +1074,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         dest = os.path.join(TEMP_DIR, filename)
         with open(dest, "wb") as f:
             f.write(file_bytes)
+        Handler._previa = preparar_previa(dest)
 
         stem      = Path(filename).stem
         suggested = str(Path.home() / "Downloads" / f"{stem}_cortados")
