@@ -99,7 +99,7 @@ def detectar_musicas(niveis: List[float], duracao: float, queda_db: float = 8.0,
     - A próxima começa `cabeca` s antes de a banda voltar.
 
     Calibrado num show real de 71 min: bateu 5:44 / 5:50 / 9:15 / 14:38 com
-    diferença de até 1 s, sem nenhum corte falso nos 15 primeiros minutos.
+    diferença de até 1 s, e 15 músicas no vídeo inteiro sem pedaços de conversa.
     """
     if not niveis:
         return []
@@ -286,27 +286,23 @@ def process_video(video: str, out_dir: str, queda_db: float, pausa_min: float,
         LOG_Q.put({"done": True, "error": True})
 
 
-def preview_video(video: str, queda_db: float, pausa_min: float,
-                  musica_min: float, limit_secs: float = 900.0):
-    """Analisa os primeiros `limit_secs` segundos e estima o vídeo inteiro."""
+def preview_video(video: str, queda_db: float, pausa_min: float, musica_min: float):
+    """Analisa o vídeo INTEIRO e devolve todas as músicas, para conferir antes de cortar.
+
+    A análise é só de áudio (a faixa média a cada 0,5 s) e leva poucos segundos mesmo
+    num show de mais de uma hora — o demorado é o corte, não a detecção.
+    """
     try:
-        full_dur  = get_video_duration(video)
-        preview_d = min(limit_secs, full_dur)
-        niveis    = medir_faixa_media(video, limit_secs if full_dur > limit_secs else None)
-        musicas   = detectar_musicas(niveis, preview_d, queda_db, pausa_min, musica_min,
-                                     parcial_no_fim=full_dur > limit_secs)
-        completas = [m for m in musicas if not m["parcial"]]
-        # estimativa pelo tempo médio de cada música (música + pausa) no trecho analisado
-        if completas:
-            ciclo = completas[-1]["end"] / len(completas)
-            estimated = max(len(musicas), round(full_dur / ciclo))
-        else:
-            estimated = len(musicas)
+        full_dur = get_video_duration(video)
+        niveis   = medir_faixa_media(video)
+        musicas  = detectar_musicas(niveis, full_dur, queda_db, pausa_min, musica_min)
+        em_musica = sum(m["dur"] for m in musicas)
         result = {
-            "preview_segments": len(completas),
-            "estimated_total":  estimated,
+            "preview_segments": len(musicas),
+            "estimated_total":  len(musicas),
             "full_duration":    full_dur,
-            "preview_duration": preview_d,
+            "preview_duration": full_dur,
+            "fora_das_musicas": round(full_dur - em_musica, 1),
             "cuts": musicas,
         }
         LOG_Q.put({"preview_done": True, "result": result})
@@ -509,11 +505,11 @@ details summary { cursor: pointer; color: #555; font-size: .82rem;
   <label class="field-label">Qualidade</label>
   <div class="opt-row">
     <div class="opt-btn" data-val="high" onclick="setOpt(this,'quality')">
-      Alta<small>CRF 18 · maior arquivo</small></div>
+      Alta<small>quase igual ao original · arquivo grande</small></div>
     <div class="opt-btn active" data-val="medium" onclick="setOpt(this,'quality')">
-      Média<small>CRF 23 · equilibrado</small></div>
+      Média<small>ótima para redes sociais</small></div>
     <div class="opt-btn" data-val="low" onclick="setOpt(this,'quality')">
-      Baixa<small>CRF 28 · menor arquivo</small></div>
+      Baixa<small>arquivo leve · WhatsApp</small></div>
   </div>
 
   <!-- format -->
@@ -547,7 +543,7 @@ details summary { cursor: pointer; color: #555; font-size: .82rem;
   <!-- action buttons -->
   <div class="actions">
     <button class="btn-preview" id="btn_preview" onclick="runPreview()" disabled>
-      🔍 Preview (15 min)
+      🔍 Preview do vídeo inteiro
     </button>
     <button class="btn-process" id="proc_btn" onclick="startProcessing()" disabled>
       ✂ Processar Vídeo
@@ -556,7 +552,7 @@ details summary { cursor: pointer; color: #555; font-size: .82rem;
 
   <!-- preview result -->
   <div class="preview-box" id="preview_box">
-    <h3>📊 Resultado do Preview (primeiros 15 min)</h3>
+    <h3>📊 Resultado do Preview</h3>
     <div id="preview_stats"></div>
     <div class="cut-list" id="cut_list"></div>
     <!-- inline video player -->
@@ -726,7 +722,7 @@ async function runPreview() {
     if (d.preview_done) {
       clearInterval(iv);
       document.getElementById('btn_preview').disabled = false;
-      document.getElementById('btn_preview').textContent = '🔍 Preview (15 min)';
+      document.getElementById('btn_preview').textContent = '🔍 Preview do vídeo inteiro';
       if (d.result) showPreview(d.result);
       else alert('Erro no preview: ' + (d.error || 'desconhecido'));
     }
@@ -745,14 +741,14 @@ function showPreview(r) {
   const fullMin = Math.round(r.full_duration / 60);
   document.getElementById('preview_stats').innerHTML = `
     <div class="preview-stat"><span>Duração total do vídeo</span><strong>${fullMin} min</strong></div>
-    <div class="preview-stat"><span>Músicas completas nos primeiros 15 min</span><strong>${r.preview_segments}</strong></div>
-    <div class="preview-stat"><span>Estimativa para o vídeo completo</span><strong>~${r.estimated_total} músicas</strong></div>
+    <div class="preview-stat"><span>Músicas encontradas</span><strong>${r.preview_segments}</strong></div>
+    <div class="preview-stat"><span>Fica de fora (conversa, intervalos)</span><strong>${fmtSecs(r.fora_das_musicas || 0)}</strong></div>
   `;
 
   const cl = document.getElementById('cut_list');
-  if (r.cuts.length === 0 || (r.cuts.length === 1 && r.cuts[0].start === 0 && r.cuts[0].dur >= 890)) {
+  if (r.cuts.length <= 1) {
     cl.innerHTML = `<div style="color:#f0a030;padding:10px 0">
-      ⚠️ Nenhuma pausa entre músicas nos primeiros 15 min.<br>
+      ⚠️ Nenhuma pausa entre músicas no vídeo.<br>
       <span style="color:#666;font-size:.78rem">
         Em ⚙ Configurações avançadas, diminua a sensibilidade
         (ex: <strong style="color:#aaa">6</strong>) ou a pausa mínima
@@ -765,7 +761,7 @@ function showPreview(r) {
   cl.innerHTML = '<div style="color:#4a90d9;margin-bottom:6px">▶ Clique para ouvir cada trecho detectado:</div>' +
     r.cuts.map((c,i) => `
       <div class="cut-item">
-        <div class="cut-info">Música ${i+1} &nbsp;·&nbsp; ${fmtSecs(c.start)} → ${fmtSecs(c.end)} &nbsp;<span style="color:#555">(${fmtSecs(c.dur)}${c.parcial ? ' · continua depois dos 15 min' : ''})</span></div>
+        <div class="cut-info">Música ${i+1} &nbsp;·&nbsp; ${fmtSecs(c.start)} → ${fmtSecs(c.end)} &nbsp;<span style="color:#555">(${fmtSecs(c.dur)})</span></div>
         <button class="btn-play-cut" id="playbtn_${i}" onclick="playAt(${c.start}, ${c.end}, ${i}, 'Música ${i+1}')">▶ Play</button>
       </div>`
     ).join('');
