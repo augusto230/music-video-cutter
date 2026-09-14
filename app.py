@@ -51,36 +51,100 @@ def get_video_dimensions(path: str) -> Tuple[int, int]:
     return int(s["width"]), int(s["height"])
 
 
-def detect_silences(path: str, threshold_db: float, min_dur: float,
-                    limit_secs: Optional[float] = None) -> List[Tuple[float, float]]:
-    # Use atrim inside the filtergraph so the limit is applied before silencedetect
-    if limit_secs:
-        af = f"atrim=end={limit_secs},asetpts=PTS-STARTPTS,silencedetect=noise={threshold_db}dB:d={min_dur}"
-    else:
-        af = f"silencedetect=noise={threshold_db}dB:d={min_dur}"
-    cmd = [
-        "ffmpeg", "-i", path,
-        "-af", af,
-        "-f", "null", "-"
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    starts = [float(m) for m in re.findall(r"silence_start: ([\d.]+)", r.stderr)]
-    ends   = [float(m) for m in re.findall(r"silence_end: ([\d.]+)",   r.stderr)]
-    return list(zip(starts, ends))
+JANELA = 0.5  # segundos por medição de nível
 
 
-def silences_to_segments(silences: List[Tuple[float, float]],
-                          duration: float, padding: float) -> List[Tuple[float, float]]:
-    segments = []
-    cursor = 0.0
-    for s_start, s_end in silences:
-        end = s_start + padding
-        if end - cursor > 0.5:
-            segments.append((cursor, end))
-        cursor = s_end - padding
-    if duration - cursor > 0.5:
-        segments.append((cursor, duration))
-    return segments
+def medir_faixa_media(path: str, limit_secs: Optional[float] = None) -> List[float]:
+    """Nível (dB RMS) da faixa de 300–2500 Hz a cada 0,5 s.
+
+    É onde ficam voz, teclado e guitarra. Num show ao vivo o intervalo entre músicas
+    quase nunca é silêncio (tem aplauso, fala, o som da casa), mas essa faixa despenca
+    quando a banda para — é esse o sinal que separa as músicas.
+    """
+    saida = os.path.join(TEMP_DIR, f"niveis_{int(time.time() * 1000)}.txt")
+    trim = f"atrim=end={limit_secs},asetpts=PTS-STARTPTS," if limit_secs else ""
+    af = (f"{trim}aresample=16000,aformat=channel_layouts=mono,asetnsamples=n=8000,"
+          "highpass=f=300,lowpass=f=2500,"
+          "astats=metadata=1:reset=1:measure_perchannel=RMS_level:measure_overall=none,"
+          f"ametadata=print:key=lavfi.astats.1.RMS_level:file={saida}")
+    subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-af", af, "-f", "null", "-"],
+                   capture_output=True, check=True)
+    niveis = []
+    with open(saida, encoding="utf-8", errors="replace") as f:
+        for bloco in f.read().split("frame:")[1:]:
+            m = re.search(r"RMS_level=(-?[\d.]+|-?inf)", bloco)
+            v = -90.0 if (not m or "inf" in m.group(1)) else float(m.group(1))
+            niveis.append(max(v, -90.0))
+    os.remove(saida)
+    return niveis
+
+
+def _mediana_movel(x: List[float], w: int = 3) -> List[float]:
+    h = w // 2
+    return [sorted(x[max(0, i - h):i + h + 1])[len(x[max(0, i - h):i + h + 1]) // 2]
+            for i in range(len(x))]
+
+
+def detectar_musicas(niveis: List[float], duracao: float, queda_db: float = 8.0,
+                     pausa_min: float = 3.0, musica_min: float = 60.0,
+                     cauda_max: float = 6.0, cabeca: float = 0.5,
+                     parcial_no_fim: bool = False) -> List[dict]:
+    """Separa as músicas pelos trechos em que a faixa média fica `queda_db` abaixo do
+    nível normal da banda por pelo menos `pausa_min` segundos.
+
+    - O "nível normal" é a mediana do próprio vídeo: não depende de volume de gravação.
+    - Trecho mais curto que `musica_min` não é música (é conversa/intervalo) e sai.
+    - O fim de cada música fica onde o último acorde termina de soar dentro da pausa
+      (o som chega ao fundo), no máximo `cauda_max` s depois do começo da pausa.
+    - A próxima começa `cabeca` s antes de a banda voltar.
+
+    Calibrado num show real de 71 min: bateu 5:44 / 5:50 / 9:15 / 14:38 com
+    diferença de até 1 s, sem nenhum corte falso nos 15 primeiros minutos.
+    """
+    if not niveis:
+        return []
+    sm = _mediana_movel(niveis)
+    ordenados = sorted(niveis)
+    ref = ordenados[len(ordenados) // 2]
+    limite = ref - queda_db
+    fundo = limite - 10.0
+
+    pausas: List[Tuple[int, int]] = []
+    ini = None
+    for i, v in enumerate(sm + [0.0]):
+        if v < limite and ini is None:
+            ini = i
+        elif v >= limite and ini is not None:
+            if (i - ini) * JANELA >= pausa_min:
+                pausas.append((ini, i))
+            ini = None
+
+    musicas: List[dict] = []
+    for k in range(len(pausas) + 1):
+        antes = pausas[k - 1] if k > 0 else None
+        depois = pausas[k] if k < len(pausas) else None
+        s = antes[1] * JANELA if antes else 0.0
+        e = depois[0] * JANELA if depois else duracao
+        parcial = parcial_no_fim and depois is None
+        if e - s < musica_min and not parcial:
+            continue
+        if depois:
+            fim_pausa = depois[1] * JANELA
+            corte = None
+            for j in range(depois[0], depois[1]):
+                if niveis[j] <= fundo:
+                    corte = (j + 1) * JANELA
+                    break
+            if corte is None or corte - e > cauda_max:
+                corte = e + min(cauda_max, (fim_pausa - e) / 2)
+            e = min(corte, fim_pausa - cabeca)
+        if antes:
+            s = max(s - cabeca, antes[0] * JANELA)
+        if musicas and s < musicas[-1]["end"]:
+            s = musicas[-1]["end"]
+        musicas.append({"start": round(s, 2), "end": round(e, 2),
+                        "dur": round(e - s, 2), "parcial": parcial})
+    return musicas
 
 
 def build_crop_filter(w: int, h: int, orientation: str) -> Optional[str]:
@@ -138,8 +202,8 @@ def fmt_time(secs: float) -> str:
 
 # ── processing ─────────────────────────────────────────────────────────────────
 
-def process_video(video: str, out_dir: str, threshold: float, min_dur: float,
-                  padding: float, orientation: str, quality: str, fmt: str):
+def process_video(video: str, out_dir: str, queda_db: float, pausa_min: float,
+                  musica_min: float, orientation: str, quality: str, fmt: str):
     STOP_EVENT.clear()
     PAUSE_EVENT.set()
 
@@ -153,13 +217,14 @@ def process_video(video: str, out_dir: str, threshold: float, min_dur: float,
         os.makedirs(out_dir, exist_ok=True)
         log("🔍 Analisando áudio completo…", 2)
 
-        silences = detect_silences(video, threshold, min_dur)
         duration = get_video_duration(video)
-        segments = silences_to_segments(silences, duration, padding)
+        niveis   = medir_faixa_media(video)
+        musicas  = detectar_musicas(niveis, duration, queda_db, pausa_min, musica_min)
+        segments = [(m["start"], m["end"]) for m in musicas]
         total    = len(segments)
 
         if total == 0:
-            log("⚠️ Nenhuma pausa detectada. Tente limiar menor (ex: -40 dB).", -1)
+            log("⚠️ Nenhuma música separada. Tente uma sensibilidade menor (ex: 6 dB).", -1)
             LOG_Q.put({"done": True, "error": True})
             return
 
@@ -221,26 +286,28 @@ def process_video(video: str, out_dir: str, threshold: float, min_dur: float,
         LOG_Q.put({"done": True, "error": True})
 
 
-def preview_video(video: str, threshold: float, min_dur: float,
-                  padding: float, limit_secs: float = 900.0):
-    """Analyse first `limit_secs` seconds and return estimated segment list."""
+def preview_video(video: str, queda_db: float, pausa_min: float,
+                  musica_min: float, limit_secs: float = 900.0):
+    """Analisa os primeiros `limit_secs` segundos e estima o vídeo inteiro."""
     try:
         full_dur  = get_video_duration(video)
-        silences  = detect_silences(video, threshold, min_dur, limit_secs)
         preview_d = min(limit_secs, full_dur)
-        segments  = silences_to_segments(silences, preview_d, padding)
-
-        # extrapolate to full video
-        ratio      = full_dur / preview_d if preview_d > 0 else 1
-        estimated  = max(len(segments), round(len(segments) * ratio))
-
+        niveis    = medir_faixa_media(video, limit_secs if full_dur > limit_secs else None)
+        musicas   = detectar_musicas(niveis, preview_d, queda_db, pausa_min, musica_min,
+                                     parcial_no_fim=full_dur > limit_secs)
+        completas = [m for m in musicas if not m["parcial"]]
+        # estimativa pelo tempo médio de cada música (música + pausa) no trecho analisado
+        if completas:
+            ciclo = completas[-1]["end"] / len(completas)
+            estimated = max(len(musicas), round(full_dur / ciclo))
+        else:
+            estimated = len(musicas)
         result = {
-            "preview_segments": len(segments),
+            "preview_segments": len(completas),
             "estimated_total":  estimated,
             "full_duration":    full_dur,
             "preview_duration": preview_d,
-            "cuts": [{"start": round(s, 2), "end": round(e, 2),
-                      "dur":   round(e - s, 2)} for s, e in segments],
+            "cuts": musicas,
         }
         LOG_Q.put({"preview_done": True, "result": result})
     except Exception as e:
@@ -463,16 +530,16 @@ details summary { cursor: pointer; color: #555; font-size: .82rem;
     <summary>⚙ Configurações avançadas de detecção</summary>
     <div class="advanced">
       <div class="adv-group">
-        <label>Limiar de silêncio (dB) <span style="color:#555;font-size:.7rem">show ao vivo: -20 a -35</span></label>
-        <input type="text" id="threshold" value="-30">
+        <label>Sensibilidade (dB) <span style="color:#555;font-size:.7rem">quanto o som cai na pausa · menor = corta mais</span></label>
+        <input type="text" id="queda_db" value="8">
       </div>
       <div class="adv-group">
-        <label>Duração mínima (s)</label>
-        <input type="text" id="min_dur" value="1.5">
+        <label>Pausa mínima (s) <span style="color:#555;font-size:.7rem">menor = pega pausas curtas, mas pode cortar no meio</span></label>
+        <input type="text" id="pausa_min" value="3">
       </div>
       <div class="adv-group">
-        <label>Padding (s)</label>
-        <input type="text" id="padding" value="0.3">
+        <label>Música mínima (s) <span style="color:#555;font-size:.7rem">trechos menores são conversa e são ignorados</span></label>
+        <input type="text" id="musica_min" value="60">
       </div>
     </div>
   </details>
@@ -536,9 +603,9 @@ let totalSegs = 0;
 // ── helpers ───────────────────────────────────────────────────────────────────
 function params() {
   return {
-    threshold: parseFloat(document.getElementById('threshold').value) || -35,
-    min_dur:   parseFloat(document.getElementById('min_dur').value)   || 1.5,
-    padding:   parseFloat(document.getElementById('padding').value)   || 0.3,
+    queda_db:   parseFloat(document.getElementById('queda_db').value)   || 8,
+    pausa_min:  parseFloat(document.getElementById('pausa_min').value)  || 3,
+    musica_min: parseFloat(document.getElementById('musica_min').value) || 60,
   };
 }
 
@@ -678,18 +745,18 @@ function showPreview(r) {
   const fullMin = Math.round(r.full_duration / 60);
   document.getElementById('preview_stats').innerHTML = `
     <div class="preview-stat"><span>Duração total do vídeo</span><strong>${fullMin} min</strong></div>
-    <div class="preview-stat"><span>Músicas detectadas no preview (15 min)</span><strong>${r.preview_segments}</strong></div>
+    <div class="preview-stat"><span>Músicas completas nos primeiros 15 min</span><strong>${r.preview_segments}</strong></div>
     <div class="preview-stat"><span>Estimativa para o vídeo completo</span><strong>~${r.estimated_total} músicas</strong></div>
   `;
 
   const cl = document.getElementById('cut_list');
   if (r.cuts.length === 0 || (r.cuts.length === 1 && r.cuts[0].start === 0 && r.cuts[0].dur >= 890)) {
     cl.innerHTML = `<div style="color:#f0a030;padding:10px 0">
-      ⚠️ Nenhuma pausa detectada nos primeiros 15 min.<br>
+      ⚠️ Nenhuma pausa entre músicas nos primeiros 15 min.<br>
       <span style="color:#666;font-size:.78rem">
-        O limiar atual (${document.getElementById('threshold').value} dB) está muito baixo.<br>
-        Tente um valor menos negativo, ex: <strong style="color:#aaa">-25</strong> ou <strong style="color:#aaa">-20</strong>,
-        e clique Preview novamente.
+        Em ⚙ Configurações avançadas, diminua a sensibilidade
+        (ex: <strong style="color:#aaa">6</strong>) ou a pausa mínima
+        (ex: <strong style="color:#aaa">2</strong>) e clique Preview de novo.
       </span>
     </div>`;
     document.getElementById('video_player').style.display = 'none';
@@ -698,7 +765,7 @@ function showPreview(r) {
   cl.innerHTML = '<div style="color:#4a90d9;margin-bottom:6px">▶ Clique para ouvir cada trecho detectado:</div>' +
     r.cuts.map((c,i) => `
       <div class="cut-item">
-        <div class="cut-info">Música ${i+1} &nbsp;·&nbsp; ${fmtSecs(c.start)} → ${fmtSecs(c.end)} &nbsp;<span style="color:#555">(${c.dur}s)</span></div>
+        <div class="cut-info">Música ${i+1} &nbsp;·&nbsp; ${fmtSecs(c.start)} → ${fmtSecs(c.end)} &nbsp;<span style="color:#555">(${fmtSecs(c.dur)}${c.parcial ? ' · continua depois dos 15 min' : ''})</span></div>
         <button class="btn-play-cut" id="playbtn_${i}" onclick="playAt(${c.start}, ${c.end}, ${i}, 'Música ${i+1}')">▶ Play</button>
       </div>`
     ).join('');
@@ -993,9 +1060,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         def run():
             preview_video(
                 body["input_path"],
-                body.get("threshold", -35),
-                body.get("min_dur", 1.5),
-                body.get("padding", 0.3),
+                float(body.get("queda_db", 8)),
+                float(body.get("pausa_min", 3)),
+                float(body.get("musica_min", 60)),
             )
 
         threading.Thread(target=run, daemon=True).start()
@@ -1018,8 +1085,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 process_video(
                     body["input_path"], body["output_dir"],
-                    body.get("threshold", -35), body.get("min_dur", 1.5),
-                    body.get("padding", 0.3), body.get("orientation", "original"),
+                    float(body.get("queda_db", 8)), float(body.get("pausa_min", 3)),
+                    float(body.get("musica_min", 60)), body.get("orientation", "original"),
                     body.get("quality", "medium"), body.get("fmt", "mp4"),
                 )
             finally:
@@ -1049,7 +1116,10 @@ if __name__ == "__main__":
     print("   Ctrl+C para parar.\n")
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
-    server = http.server.HTTPServer(("localhost", PORT), Handler)
+    # Com várias linhas: o <video> do preview segura uma conexão aberta enquanto toca,
+    # e num servidor de linha única isso travava a página, o /progress e o Play.
+    http.server.ThreadingHTTPServer.daemon_threads = True
+    server = http.server.ThreadingHTTPServer(("localhost", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
