@@ -818,6 +818,7 @@ function playAt(start, end, idx, label) {
   document.getElementById('video_label').textContent = label;
 
   currentPlayBtn = document.getElementById('playbtn_' + idx);
+  currentPlayBtn.tocar = () => playAt(start, end, idx, label);
   currentPlayBtn.classList.add('active');
   currentPlayBtn.textContent = '⏹ Stop';
   currentPlayBtn.onclick = () => { vid.pause(); currentPlayBtn.classList.remove('active'); currentPlayBtn.textContent = '▶ Play'; currentPlayBtn.onclick = () => playAt(start, end, idx, label); };
@@ -838,6 +839,13 @@ async function startProcessing() {
   if (!uploadedPath) { alert('Selecione um vídeo primeiro.'); return; }
   const output_dir = getOutputDir();
   if (!output_dir)  { alert('Informe a pasta de saída.'); return; }
+
+  // A prévia (com o player) some da tela durante o corte: sem pausar, o vídeo
+  // seguia tocando escondido.
+  const vid = document.getElementById('preview_video');
+  if (vid) vid.pause();
+  if (endTimer) { clearTimeout(endTimer); endTimer = null; }
+  if (currentPlayBtn) { currentPlayBtn.classList.remove('active'); currentPlayBtn.textContent = '▶ Play'; currentPlayBtn.onclick = currentPlayBtn.tocar; }
 
   document.getElementById('proc_btn').disabled = true;
   document.getElementById('btn_preview').disabled = true;
